@@ -3,17 +3,18 @@ Dashboard de Carregamento x Meta Semanal  |  Colchões BonSono
 
 Como rodar:
     pip install -r requirements.txt
-    streamlit run dashboard_carregamento.py
+    streamlit run app.py
 
-Arquivos ao lado do script (opcionais, mas recomendados):
-    logo_bonsono.png         -> logo exibido no cabeçalho (troque pelo original em alta resolução)
+Arquivos ao lado do script:
+    logo_bonsono.png         -> logo exibido no cabeçalho
     .streamlit/config.toml   -> tema (cores) do Streamlit
 
-Formato esperado da planilha:
-  - Linha de cabeçalho começando com "PLACA", "MOTORISTA" e as datas do dia a dia
-  - Linha "TOTAL ..." encerrando cada bloco (ex.: TOTAL COMERCIAL, TOTAL LOJAS)
-  - O rótulo "META / CAMINHÃO" com o valor ao lado
-O primeiro bloco é a frota com meta; os demais viram seções só com o carregamento.
+Formatos de planilha aceitos (detecção automática):
+  NOVO   PLACA | [data: motorista | valor] x N dias | ...   (o motorista pode mudar de um dia para outro)
+  ANTIGO PLACA | MOTORISTA | [data: valor] x N dias | ...
+Em ambos: uma linha "TOTAL ..." encerra cada bloco (COMERCIAL, LOJAS) e o rótulo
+"META / CAMINHÃO" traz a meta semanal. O primeiro bloco é a frota com meta; os demais
+viram seções só com o carregamento.
 """
 import io
 from datetime import datetime
@@ -25,10 +26,13 @@ import plotly.graph_objects as go
 import streamlit as st
 
 NAVY = "#003399"
-CORES = {"Meta batida": "#2E9E5B", "No ritmo": "#2A6FDB", "Atenção": "#F2A33A", "Crítico": "#D64545"}
-FUNDO = {"Meta batida": "#D9F2E3", "No ritmo": "#DCE7FB", "Atenção": "#FDEBCB", "Crítico": "#F9D9D9"}
-EMOJI = {"Meta batida": "🟢", "No ritmo": "🔵", "Atenção": "🟠", "Crítico": "🔴"}
+CORES = {"Meta batida": "#2E9E5B", "A caminho": "#2A6FDB", "Atenção": "#F2A33A", "Crítico": "#D64545"}
+FUNDO = {"Meta batida": "#D9F2E3", "A caminho": "#DCE7FB", "Atenção": "#FDEBCB", "Crítico": "#F9D9D9"}
+EMOJI = {"Meta batida": "🟢", "A caminho": "🔵", "Atenção": "🟠", "Crítico": "🔴"}
 DIAS_SEMANA = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+DIAS_FULL = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+M_DEC = "Dias decorridos da semana"
+M_CARGA = "Somente dias com carga do caminhão"
 
 CSS = """
 <style>
@@ -114,7 +118,8 @@ def ler_planilha(conteudo: bytes):
 
     blocos = {}
     for h in [i for i, v in enumerate(col0) if v == "PLACA"]:
-        datas_col = {c: pd.Timestamp(v) for c, v in raw.iloc[h].items()
+        hdr = raw.iloc[h]
+        datas_col = {c: pd.Timestamp(v) for c, v in hdr.items()
                      if isinstance(v, (pd.Timestamp, datetime))}
         if not datas_col:
             continue
@@ -131,15 +136,58 @@ def ler_planilha(conteudo: bytes):
             linhas.append(r)
         nome = nome or f"Bloco {len(blocos) + 1}"
 
-        regs = []
+        # Layout: se a coluna da data só tem texto (nomes ou "-"), o valor está na coluna ao lado
+        pares = {}
+        for c, d in datas_col.items():
+            tem_num = any(pd.notna(pd.to_numeric(raw.iat[r, c], errors="coerce")) for r in linhas)
+            tem_txt = any(isinstance(raw.iat[r, c], str) and raw.iat[r, c].strip() for r in linhas)
+            pares[d] = (c, c + 1) if (tem_txt and not tem_num and c + 1 < raw.shape[1]) else (None, c)
+        col_mot = 1 if _norm(hdr.iat[1]).upper() == "MOTORISTA" else None
+
+        regs, nomes_dia = [], []
         for r in linhas:
-            reg = {"Placa": col0.iat[r], "Motorista": _norm(raw.iat[r, 1]) or "(sem motorista)"}
-            for c, d in datas_col.items():
-                reg[d] = pd.to_numeric(raw.iat[r, c], errors="coerce")
+            reg, nm_dia, vol = {"Placa": col0.iat[r]}, {}, {}
+            for d, (cn, cv) in pares.items():
+                val = pd.to_numeric(raw.iat[r, cv], errors="coerce")
+                reg[d] = val
+                nm = _norm(raw.iat[r, cn]) if cn is not None else ""
+                nm = "" if nm in ("-", "–") else nm
+                nm_dia[d] = nm
+                if nm and pd.notna(val):
+                    vol[nm] = vol.get(nm, 0) + val
+            if col_mot is not None:
+                principal = lista = _norm(raw.iat[r, col_mot])
+                nm_dia = {d: principal for d in pares}
+            else:
+                ordem = sorted(vol, key=vol.get, reverse=True)
+                ordem += [x for x in dict.fromkeys(nm_dia.values()) if x and x not in ordem]
+                principal, lista = (ordem[0] if ordem else ""), ", ".join(ordem)
+            reg["Motorista"] = principal or "(sem motorista)"
+            reg["Motoristas"] = lista or "(sem motorista)"
             regs.append(reg)
+            nomes_dia.append(nm_dia)
         if regs:
-            blocos[nome] = (pd.DataFrame(regs), sorted(datas_col.values()))
+            df = pd.DataFrame(regs)
+            blocos[nome] = (df, sorted(datas_col.values()), pd.DataFrame(nomes_dia, index=df.index))
     return meta, blocos
+
+
+def verificar_dados(blocos):
+    """Aponta lançamentos que merecem conferência (podem ser legítimos)."""
+    avisos, vistos = [], {}
+    for nome, (df, datas, _) in blocos.items():
+        for _, row in df.iterrows():
+            for dt in datas:
+                if pd.notna(row[dt]) and row[dt] > 0:
+                    vistos.setdefault((row["Placa"], dt, round(row[dt], 2)), []).append(nome)
+            for a, b in zip(datas, datas[1:]):
+                if pd.notna(row[a]) and row[a] > 0 and round(row[a], 2) == round(row[b], 2):
+                    avisos.append(f"**{row['Placa']}** ({row['Motorista']}): {brl(row[a])} idêntico em "
+                                  f"{rotulo_data(a)} e {rotulo_data(b)}")
+    for (placa, dt, v), onde in vistos.items():
+        if len(onde) > 1:
+            avisos.insert(0, f"**{placa}** em {rotulo_data(dt)}: {brl(v)} lançado em {' e '.join(onde)} (possível duplicidade)")
+    return avisos
 
 
 # ------------------------------------------------------------------- cálculo
@@ -147,13 +195,13 @@ def calcular(df, datas, meta, dias_semana, metodo, limiar):
     d = df.copy()
     v = d[datas]
     d["Acumulado"] = v.sum(axis=1, skipna=True)
-    d["Dias lançados"] = v.notna().sum(axis=1)
+    d["Dias com carga"] = (v > 0).sum(axis=1)
 
-    idx = [i for i, dt in enumerate(datas) if v[dt].notna().any()]
+    idx = [i for i, dt in enumerate(datas) if (v[dt] > 0).any()]
     dias_decorridos = (max(idx) + 1) if idx else 0
 
-    if metodo == "Dias lançados de cada motorista":
-        base = d["Dias lançados"].astype(float)
+    if metodo == M_CARGA:
+        base = d["Dias com carga"].astype(float)
     else:
         base = pd.Series(float(dias_decorridos), index=d.index)
     prev = (d["Acumulado"] / base.replace(0, np.nan) * dias_semana).fillna(0)
@@ -165,8 +213,8 @@ def calcular(df, datas, meta, dias_semana, metodo, limiar):
     d["Falta / Excede"] = d["Acumulado"] - meta
     d["Status"] = np.select(
         [d["Acumulado"] >= meta, d["Previsão"] >= meta, d["Previsão"] >= limiar * meta],
-        ["Meta batida", "No ritmo", "Atenção"], default="Crítico")
-    d["Rótulo"] = d["Motorista"].where(d["Motorista"] != "(sem motorista)", d["Placa"])
+        ["Meta batida", "A caminho", "Atenção"], default="Crítico")
+    d["Rótulo"] = np.where(d["Motorista"] != "(sem motorista)", d["Motorista"] + " · " + d["Placa"], d["Placa"])
     return d, dias_decorridos
 
 
@@ -179,26 +227,29 @@ def _base(fig, titulo, altura, top=75, **kw):
     return fig
 
 
-def grafico_ranking(d, altura):
+def grafico_ranking(d, altura, fim, mostrar_prev):
     d = d.sort_values("% Meta")
     fig = go.Figure()
     fig.add_bar(
         y=d["Rótulo"], x=d["% Meta"], orientation="h", name="Acumulado", showlegend=False,
         marker_color=[CORES[s] for s in d["Status"]],
         text=[f"{p:.0f}%" for p in d["% Meta"]], textposition="outside", cliponaxis=False,
-        customdata=np.stack([d["Acumulado"].map(brl), d["Previsão"].map(brl), d["Placa"]], axis=-1),
-        hovertemplate="<b>%{y}</b> (%{customdata[2]})<br>Acumulado: %{customdata[0]}"
-                      "<br>% da meta: %{x:.1f}%<br>Previsão sexta: %{customdata[1]}<extra></extra>")
-    fig.add_scatter(
-        y=d["Rótulo"], x=d["% Previsão"], mode="markers", name="Previsão até sexta",
-        marker=dict(symbol="diamond", size=9, color="#1F2937", line=dict(width=1, color="white")),
-        hovertemplate="Previsão: %{x:.0f}% da meta<extra></extra>")
+        customdata=np.stack([d["Acumulado"].map(brl), d["Previsão"].map(brl), d["Placa"], d["Motoristas"]], axis=-1),
+        hovertemplate="<b>%{customdata[2]}</b> · %{customdata[3]}<br>Acumulado: %{customdata[0]}"
+                      "<br>% da meta: %{x:.1f}%"
+                      + (f"<br>Previsão {fim}: %{{customdata[1]}}" if mostrar_prev else "") + "<extra></extra>")
+    if mostrar_prev:
+        fig.add_scatter(
+            y=d["Rótulo"], x=d["% Previsão"], mode="markers", name=f"Previsão até {fim}",
+            marker=dict(symbol="diamond", size=9, color="#1F2937", line=dict(width=1, color="white")),
+            hovertemplate="Previsão: %{x:.0f}% da meta<extra></extra>")
     fig.add_vline(x=100, line_dash="dash", line_color="#6B7280",
                   annotation_text="Meta", annotation_position="top")
-    _base(fig, "Acumulado × Meta por Motorista  (◆ previsão até sexta)", altura,
+    topo = d["% Previsão"].max() if mostrar_prev else d["% Meta"].max()
+    _base(fig, "Acumulado × Meta por Caminhão" + (f"  (◆ previsão até {fim})" if mostrar_prev else ""), altura,
           xaxis=dict(title="% da meta semanal", gridcolor="#EEF1F6", zeroline=False,
-                     range=[0, max(130, d["% Previsão"].max() * 1.12)]),
-          yaxis=dict(showgrid=False, automargin=True), bargap=0.28,
+                     range=[0, max(130, topo * 1.12)]),
+          yaxis=dict(showgrid=False, automargin=True, range=[-0.5, max(len(d), 8) - 0.5]), bargap=0.28,
           legend=dict(orientation="h", y=1.0, yanchor="bottom", x=0.0))
     return fig
 
@@ -218,27 +269,26 @@ def grafico_status(d, altura):
 
 def grafico_diario(d, datas, meta_total, dias_semana, altura, titulo="Carregamento Diário da Frota"):
     n = len(d)
-    somas = [d[dt].sum() if d[dt].notna().any() else None for dt in datas]
-    lanc = [int(d[dt].notna().sum()) for dt in datas]
+    somas = [d[dt].sum() if (d[dt] > 0).any() else None for dt in datas]
+    com_carga = [int((d[dt] > 0).sum()) for dt in datas]
     fig = go.Figure()
     fig.add_bar(
-        x=[rotulo_data(dt) for dt in datas], y=somas, name="Carregado no dia",
-        marker_color=[NAVY if q == n else "#8FB0EA" for q in lanc],
-        text=[mil(s) if s is not None else "" for s in somas], textposition="outside",
-        customdata=lanc,
-        hovertemplate=f"%{{x}}<br>Carregado: R$ %{{y:,.2f}}<br>Lançamentos: %{{customdata}}/{n}"
+        x=[rotulo_data(dt) for dt in datas], y=somas, name="Carregado no dia", marker_color=NAVY,
+        text=[mil(x) if x is not None else "" for x in somas], textposition="outside",
+        customdata=com_carga,
+        hovertemplate=f"%{{x}}<br>Carregado: R$ %{{y:,.2f}}<br>Caminhões com carga: %{{customdata}}/{n}"
                       "<extra></extra>")
     if meta_total:
         fig.add_hline(y=meta_total / dias_semana, line_dash="dash", line_color="#D64545",
                       annotation_text="Meta diária linear", annotation_position="top right",
                       annotation_font_color="#D64545")
-    topo = max([s for s in somas if s] + [meta_total / dias_semana if meta_total else 0]) * 1.2
-    _base(fig, titulo + "  (barra clara = dia parcial)", altura, showlegend=False,
+    topo = max([x for x in somas if x] + [meta_total / dias_semana if meta_total else 0]) * 1.2 or 1
+    _base(fig, titulo, altura, showlegend=False,
           yaxis=dict(title="R$", gridcolor="#EEF1F6", range=[0, topo]), xaxis=dict(showgrid=False))
     return fig
 
 
-def grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, altura):
+def grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, altura, fim):
     rot = [rotulo_data(dt) for dt in datas]
     diarios = [d[dt].sum() for dt in datas[:dias_dec]]
     acum = list(np.cumsum(diarios))
@@ -253,7 +303,7 @@ def grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, alt
                     hovertemplate="Realizado: R$ %{y:,.0f}<extra></extra>")
     if 0 < dias_dec < len(datas):
         fig.add_scatter(x=[rot[dias_dec - 1], rot[-1]], y=[acum[-1], previsao], mode="lines+markers",
-                        name="Previsão até sexta", line=dict(color="#2A6FDB", dash="dot", width=3),
+                        name=f"Previsão até {fim}", line=dict(color="#2A6FDB", dash="dot", width=3),
                         marker=dict(size=[0, 10], symbol="diamond"),
                         hovertemplate="Previsão: R$ %{y:,.0f}<extra></extra>")
     _base(fig, "Acumulado da Semana × Trajetória da Meta", altura,
@@ -262,16 +312,18 @@ def grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, alt
     return fig
 
 
-def grafico_heatmap(d, datas):
+def grafico_heatmap(d, datas, nomes_dia):
     d = d.sort_values("Acumulado", ascending=False)
     z = d[datas].to_numpy(dtype=float)
+    z = np.where(z > 0, z, np.nan)
     texto = [[mil(x) if pd.notna(x) else "" for x in linha] for linha in z]
+    nm = nomes_dia.loc[d.index, datas].to_numpy()
     fig = go.Figure(go.Heatmap(
         z=z, x=[rotulo_data(dt) for dt in datas], y=d["Rótulo"], text=texto, texttemplate="%{text}",
-        colorscale="Blues", zmin=0, hoverongaps=False, xgap=2, ygap=2,
+        customdata=nm, colorscale="Blues", zmin=0, hoverongaps=False, xgap=2, ygap=2,
         colorbar=dict(title="R$", thickness=14, len=0.9),
-        hovertemplate="%{y}<br>%{x}: R$ %{z:,.2f}<extra></extra>"))
-    _base(fig, "Carregamento por Motorista e Dia  (R$ mil · vazio = não lançado)",
+        hovertemplate="%{y}<br>%{x}<br>Motorista no dia: %{customdata}<br>R$ %{z:,.2f}<extra></extra>"))
+    _base(fig, "Carregamento por Caminhão e Dia  (R$ mil · vazio = sem carga)",
           max(380, 30 * len(d) + 110), top=100,
           yaxis=dict(autorange="reversed", automargin=True, showgrid=False),
           xaxis=dict(side="top", showgrid=False))
@@ -279,15 +331,22 @@ def grafico_heatmap(d, datas):
 
 
 # ------------------------------------------------------------------- tabela
-def tabela_estilizada(d, datas):
+def _brl_dia(v):
+    return "–" if pd.isna(v) or v == 0 else brl(v)
+
+
+def tabela_estilizada(d, datas, completa=False):
     cols_dias = {dt: rotulo_data(dt) for dt in datas}
-    t = d.rename(columns=cols_dias)[
-        ["Placa", "Motorista", *cols_dias.values(), "Acumulado", "% Meta", "Meta",
-         "Falta / Excede", "Previsão", "% Previsão", "Status"]].reset_index(drop=True)
+    prev = [] if completa else ["Previsão", "% Previsão"]
+    t = d.rename(columns={**cols_dias, "Motoristas": "Motorista(s)"})[
+        ["Placa", "Motorista(s)", *cols_dias.values(), "Acumulado", "% Meta", "Meta",
+         "Falta / Excede", *prev, "Status"]].reset_index(drop=True)
     status = list(t["Status"])
     t["Status"] = [f"{EMOJI[s]} {s}" for s in status]
-    money = [*cols_dias.values(), "Acumulado", "Meta", "Falta / Excede", "Previsão"]
-    sty = (t.style.format({**{c: brl for c in money}, "% Meta": "{:.1f}%", "% Previsão": "{:.1f}%"}, na_rep="–")
+    fmt = {**{c: _brl_dia for c in cols_dias.values()},
+           **{c: brl for c in ["Acumulado", "Meta", "Falta / Excede", "Previsão"] if c in t},
+           "% Meta": "{:.1f}%", "% Previsão": "{:.1f}%"}
+    sty = (t.style.format({k: v for k, v in fmt.items() if k in t}, na_rep="–")
            .apply(lambda s: [f"background-color: {FUNDO[x]}; font-weight: 600" for x in status],
                   subset=["% Meta", "Status"]))
     return t, sty
@@ -320,7 +379,7 @@ def cabecalho(pills=""):
     with c2:
         st.markdown(
             "<div class='titulo'>🚚 Dashboard de Carregamento x Meta</div>"
-            "<div class='subtitulo'>Colchões BonSono | Acompanhamento Semanal de Carregamento por Motorista</div>"
+            "<div class='subtitulo'>Colchões BonSono | Acompanhamento Semanal de Carregamento por Caminhão e Motorista</div>"
             f"{pills}", unsafe_allow_html=True)
 
 
@@ -352,43 +411,54 @@ def main():
         return
 
     nomes = list(blocos)
-    df_frota, datas = blocos[nomes[0]]
+    df_frota, datas, nomes_dia = blocos[nomes[0]]
+    fim = DIAS_FULL[datas[-1].weekday()]
 
     with st.sidebar:
         st.markdown("### 🔍 Filtros")
-        box_mot, box_sit = st.container(), st.container()
+        box_mot, box_ocu, box_sit = st.container(), st.container(), st.container()
         st.markdown("### ⚙️ Parâmetros")
         meta = st.number_input("Meta semanal por caminhão (R$)", min_value=0.0, step=500.0,
                                value=float(meta_arq or 87500.0), format="%.2f")
-        dias_semana = int(st.number_input("Dias úteis da semana", 1, 7, len(datas)))
+        dias_semana = int(st.number_input("Dias de operação da semana", 1, 7, len(datas)))
         metodo = st.radio(
-            "Previsão até sexta", ["Dias lançados de cada motorista", "Dias decorridos da semana (todos)"],
-            help="• Dias lançados: acumulado ÷ nº de dias com lançamento do próprio motorista × dias úteis. "
-                 "Célula em branco = ainda não lançado; 0 = lançado sem carga.\n\n"
-                 "• Dias decorridos: acumulado ÷ último dia com dado na frota × dias úteis.")
+            f"Previsão até {fim}", [M_DEC, M_CARGA],
+            help="• Dias decorridos: acumulado ÷ dias já passados na semana (até o último dia com carga na frota) "
+                 "× dias de operação. Dia sem carga conta como dia perdido.\n\n"
+                 "• Somente dias com carga: acumulado ÷ dias em que o próprio caminhão carregou × dias de operação. "
+                 "Não penaliza dias de folga ou sem rota.")
         limiar = st.slider("Limite 'Atenção' (previsão ≥ % da meta)", 50, 100, 80, 5) / 100
 
     d_all, dias_dec = calcular(df_frota, datas, meta, dias_semana, metodo, limiar)
     with box_mot:
-        sel_mot = st.multiselect("Motorista", sorted(d_all["Rótulo"]), placeholder="Todos")
+        sel_mot = st.multiselect("Caminhão / Motorista", sorted(d_all["Rótulo"]), placeholder="Todos")
+    with box_ocu:
+        ocultar = st.multiselect("Ocultar caminhões (ex.: apoio)", sorted(d_all["Rótulo"]), placeholder="Nenhum",
+                                 help="Os caminhões ocultos saem das métricas e da meta da frota.")
     with box_sit:
         sel_sit = st.multiselect("Situação", list(CORES), placeholder="Todas")
 
-    d = d_all[d_all["Rótulo"].isin(sel_mot or d_all["Rótulo"]) & d_all["Status"].isin(sel_sit or list(CORES))]
+    d = d_all[d_all["Rótulo"].isin(sel_mot or d_all["Rótulo"]) & ~d_all["Rótulo"].isin(ocultar)
+              & d_all["Status"].isin(sel_sit or list(CORES))]
 
+    completa = dias_dec >= len(datas)
     ultimo = datas[dias_dec - 1] if dias_dec else None
     pills = f"<span class='pill'>📅 Semana de {datas[0]:%d/%m} a {datas[-1]:%d/%m/%Y}</span>"
     if ultimo is not None:
         pills += f"<span class='pill'>Dados até {rotulo_data(ultimo)}</span>"
-        parcial = int(df_frota[ultimo].notna().sum())
-        if parcial < len(df_frota):
-            pills += (f"<span class='pill warn'>⚠️ {rotulo_data(ultimo)}: apenas {parcial} de "
-                      f"{len(df_frota)} caminhões lançados</span>")
+    if completa:
+        pills += "<span class='pill'>✅ Semana completa</span>"
     cabecalho(pills)
 
     if d.empty:
         st.warning("Nenhum caminhão corresponde aos filtros selecionados.")
         return
+
+    avisos = verificar_dados(blocos)
+    if avisos:
+        with st.expander(f"🔎 Verificação dos dados: {len(avisos)} ponto(s) para conferir"):
+            st.caption("Podem ser legítimos, mas valem uma conferência na planilha.")
+            st.markdown("\n".join(f"- {a}" for a in avisos))
 
     n = len(d)
     meta_total = meta * n
@@ -396,6 +466,7 @@ def main():
     falta = meta_total - realizado
     pct = realizado / meta_total * 100 if meta_total else 0
     dif = previsao - meta_total
+    a_caminho = int((d["Status"] == "A caminho").sum())
 
     secao("📈", "Métricas Gerais")
     k = st.columns(6)
@@ -404,47 +475,49 @@ def main():
         kpi(brl(meta_total), "Meta da Frota", f"{n} × {brl(meta, 0)}"),
         kpi(f"{pct:.1f}%", "Meta Atingida", barra=pct),
         kpi(brl(abs(falta)), "Falta para a Meta" if falta >= 0 else "Excedente"),
-        kpi(brl(previsao), "Previsão até Sexta", f"{'▲ +' if dif >= 0 else '▼ '}{brl(dif)} vs meta",
+        kpi(brl(previsao), "Fechamento da Semana" if completa else f"Previsão até {fim.title()}",
+            "" if completa else f"{'▲ +' if dif >= 0 else '▼ '}{brl(dif)} vs meta",
             "#2E9E5B" if dif >= 0 else "#D64545"),
         kpi(f"{int((d['Status'] == 'Meta batida').sum())}/{n}", "Caminhões na Meta",
-            f"{int((d['Status'] == 'No ritmo').sum())} a caminho"),
+            f"{a_caminho} a caminho" if a_caminho else ""),
     ]
     for col, html in zip(k, cards):
         col.markdown(html, unsafe_allow_html=True)
 
     altura1 = max(430, 30 * n + 130)
-    secao("🎯", "Atingimento da Meta por Motorista")
+    secao("🎯", "Atingimento da Meta por Caminhão")
     c1, c2 = st.columns([3, 2])
-    c1.plotly_chart(grafico_ranking(d, altura1), width="stretch", theme=None)
+    c1.plotly_chart(grafico_ranking(d, altura1, fim, not completa), width="stretch", theme=None)
     c2.plotly_chart(grafico_status(d, altura1), width="stretch", theme=None)
 
     secao("📅", "Evolução Diária")
     c1, c2 = st.columns(2)
     c1.plotly_chart(grafico_diario(d, datas, meta_total, dias_semana, 400), width="stretch", theme=None)
-    c2.plotly_chart(grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, 400),
+    c2.plotly_chart(grafico_acumulado(d, datas, meta_total, dias_semana, dias_dec, previsao, 400, fim),
                     width="stretch", theme=None)
 
-    secao("🔥", "Mapa de Calor: Motorista × Dia")
-    st.plotly_chart(grafico_heatmap(d, datas), width="stretch", theme=None)
+    secao("🔥", "Mapa de Calor: Caminhão × Dia")
+    st.plotly_chart(grafico_heatmap(d, datas, nomes_dia), width="stretch", theme=None)
 
-    secao("📋", "Detalhamento por Motorista")
+    secao("📋", "Detalhamento por Caminhão")
     ordenado = d.sort_values("Acumulado", ascending=False)
-    t, sty = tabela_estilizada(ordenado, datas)
+    t, sty = tabela_estilizada(ordenado, datas, completa)
     st.dataframe(sty, width="stretch", hide_index=True)
     st.download_button("⬇️ Baixar tabela (Excel)", para_excel(t), "carregamento_vs_meta.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     for nome in nomes[1:]:
-        dfb, datas_b = blocos[nome]
+        dfb, datas_b, _ = blocos[nome]
         tot = dfb[datas_b].sum(axis=1, skipna=True)
         secao("🏪", nome)
         c0, c1, c2 = st.columns([1, 2, 3])
         c0.markdown(kpi(brl(tot.sum()), f"Total {nome}"), unsafe_allow_html=True)
         c1.plotly_chart(grafico_diario(dfb, datas_b, 0, len(datas_b), 360, f"Carregamento Diário · {nome}"),
                         width="stretch", theme=None)
-        vis = dfb.assign(Acumulado=tot).rename(columns={dt: rotulo_data(dt) for dt in datas_b})
-        c2.dataframe(vis.style.format({c: brl for c in vis.columns[2:]}, na_rep="–"),
-                     width="stretch", hide_index=True)
+        vis = dfb.assign(Acumulado=tot).rename(columns={**{dt: rotulo_data(dt) for dt in datas_b}, "Motoristas": "Motorista(s)"})
+        vis = vis[["Placa", "Motorista(s)", *[rotulo_data(dt) for dt in datas_b], "Acumulado"]]
+        fmt = {**{c: _brl_dia for c in vis.columns[2:-1]}, "Acumulado": brl}
+        c2.dataframe(vis.style.format(fmt, na_rep="–"), width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
